@@ -41,33 +41,50 @@ APICALL EXPORT std::string PLUGIN_API_VERSION() {
 // Translucent windows go through the blur path, whose inner draws don't carry the
 // surface any more, so renderTexture (the outer call, which still has it) records
 // the bar height for the draws it makes.
-static double barHeightForSurface(SP<CWLSurfaceResource> surface) {
+struct SRoundTarget {
+    double       barHeight = 0;
+    bool         mainSurface = false;
+    PHLWINDOWREF window;
+};
+
+// Surfaces of a window with a visible bar: its main surface and its subsurfaces
+// (Firefox-based browsers draw the page in a subsurface). Popups aren't windows.
+static SRoundTarget roundTargetFor(SP<CWLSurfaceResource> surface) {
     const auto PSURFACE = Desktop::View::CWLSurface::fromResource(surface);
     const auto PWINDOW  = PSURFACE ? Desktop::View::CWindow::fromView(PSURFACE->view()) : nullptr;
-    if (!PWINDOW || PWINDOW->wlSurface()->resource() != surface)
-        return 0; // only the window's main surface, not popups or subsurfaces
+    if (!PWINDOW)
+        return {};
 
     for (auto const& b : g_pGlobalState->bars) {
         if (b && b->getOwner() == PWINDOW)
-            return b->visibleHeight();
+            return {.barHeight = b->visibleHeight(), .mainSurface = PWINDOW->wlSurface()->resource() == surface, .window = PWINDOW};
     }
 
-    return 0;
+    return {};
 }
 
-static double g_currentBarHeight = 0;
+static SRoundTarget g_current;
+// Box of the last drawn main surface (render coords, before renderModif).
+// Hyprland draws the main surface first, so its subsurfaces can round to it.
+static CBox         g_mainBox;
+static PHLWINDOWREF g_mainBoxWindow;
 
 typedef void (*origRenderTexture)(Render::GL::CHyprOpenGLImpl*, Render::CRenderContext&, SP<Render::ITexture>, const CBox&, Render::GL::CHyprOpenGLImpl::STextureRenderData);
 
 static void hkRenderTexture(Render::GL::CHyprOpenGLImpl* thisptr, Render::CRenderContext& ctx, SP<Render::ITexture> tex, const CBox& box,
                             Render::GL::CHyprOpenGLImpl::STextureRenderData data) {
-    const double PREV = g_currentBarHeight;
-    if (data.surface)
-        g_currentBarHeight = g_pGlobalState->config.barFlatWindowTop->value() ? barHeightForSurface(data.surface) : 0;
+    const auto PREV = g_current;
+    if (data.surface) {
+        g_current = g_pGlobalState->config.barFlatWindowTop->value() ? roundTargetFor(data.surface) : SRoundTarget{};
+        if (g_current.mainSurface && g_current.barHeight > 0) {
+            g_mainBox       = box;
+            g_mainBoxWindow = g_current.window;
+        }
+    }
 
     (*(origRenderTexture)g_pRenderTextureHook->m_original)(thisptr, ctx, tex, box, data);
 
-    g_currentBarHeight = PREV;
+    g_current = PREV;
 }
 
 typedef WP<CShader> (*origRenderToFB)(Render::GL::CHyprOpenGLImpl*, Render::CRenderContext&, SP<Render::ITexture>, const Render::GL::CHyprOpenGLImpl::STextureRenderData&,
@@ -80,14 +97,22 @@ static WP<CShader> hkRenderToFBInternal(Render::GL::CHyprOpenGLImpl* thisptr, Re
     if (!shader || data.round <= 0 || !ctx.m_data.pMonitor || !g_pGlobalState->config.barFlatWindowTop->value())
         return shader;
 
-    const double barHeight = data.surface ? barHeightForSurface(data.surface) : g_currentBarHeight;
-
-    if (barHeight <= 0)
+    const auto TARGET = data.surface ? roundTargetFor(data.surface) : g_current;
+    if (TARGET.barHeight <= 0)
         return shader;
 
-    const double GROW = barHeight * ctx.m_data.pMonitor->m_scale * ctx.m_data.renderModif.combinedScale();
-    shader->setUniformFloat2(SHADER_TOP_LEFT, sc<float>(newBox.x), sc<float>(newBox.y - GROW));
-    shader->setUniformFloat2(SHADER_FULL_SIZE, sc<float>(newBox.width), sc<float>(newBox.height + GROW));
+    // round the window's shape, not the subsurface's own box
+    CBox shape = newBox;
+    if (!TARGET.mainSurface) {
+        if (g_mainBoxWindow != TARGET.window)
+            return shader;
+        shape = g_mainBox;
+        ctx.m_data.renderModif.applyToBox(shape);
+    }
+
+    const double GROW = TARGET.barHeight * ctx.m_data.pMonitor->m_scale * ctx.m_data.renderModif.combinedScale();
+    shader->setUniformFloat2(SHADER_TOP_LEFT, sc<float>(shape.x), sc<float>(shape.y - GROW));
+    shader->setUniformFloat2(SHADER_FULL_SIZE, sc<float>(shape.width), sc<float>(shape.height + GROW));
 
     return shader;
 }
