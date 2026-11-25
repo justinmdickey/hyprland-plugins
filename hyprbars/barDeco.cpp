@@ -716,6 +716,16 @@ CBox CHyprBar::assignedBoxGlobal() {
     return box.translate(WORKSPACEOFFSET);
 }
 
+double CHyprBar::visibleHeight() {
+    if (m_hidden || !g_pGlobalState->config.enabled->value() || !validMapped(m_pWindow))
+        return 0;
+
+    if (!m_pWindow->m_ruleApplicator->decorate().valueOrDefault())
+        return 0;
+
+    return m_bAssignedBox.h;
+}
+
 PHLWINDOW CHyprBar::getOwner() {
     return m_pWindow.lock();
 }

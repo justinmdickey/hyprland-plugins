@@ -39,9 +39,11 @@ struct SGlobalState {
         SP<Config::Values::CFontWeightValue> barTextWeight;
         SP<Config::Values::CIntValue>        barPadding;
         SP<Config::Values::CIntValue>        barButtonPadding;
-        SP<Config::Values::CBoolValue>       barBlur, barTitleEnabled, barPartOfWindow, barPrecedenceOverBorder, enabled, iconOnHover, buttonsOnHover;
+        SP<Config::Values::CBoolValue>       barBlur, barTitleEnabled, barPartOfWindow, barPrecedenceOverBorder, barFlatWindowTop, enabled, iconOnHover, buttonsOnHover;
         SP<Config::Values::CStringValue>     barTextFont, barTextAlign, barButtonsAlignment, onDoubleClick;
     } config;
 };
 
 inline UP<SGlobalState> g_pGlobalState;
+inline CFunctionHook*    g_pRenderToFBHook   = nullptr;
+inline CFunctionHook*    g_pRenderTextureHook = nullptr;

@@ -52,6 +52,9 @@ class CHyprBar : public IHyprWindowDecoration {
     void                               setTitle(std::optional<std::string> title);
     void                               onConfigReloaded();
 
+    // height of the bar in layout px when it is shown, 0 otherwise
+    double                             visibleHeight();
+
     WP<CHyprBar>                       m_self;
 
   private:

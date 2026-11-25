@@ -14,6 +14,9 @@
 #include <hyprland/src/config/lua/bindings/LuaBindingsInternal.hpp>
 #include <hyprland/src/config/lua/types/LuaConfigColor.hpp>
 #include <hyprland/src/state/MonitorState.hpp>
+#include <hyprland/src/render/OpenGL.hpp>
+#include <hyprland/src/render/Shader.hpp>
+#include <hyprland/src/desktop/view/WLSurface.hpp>
 
 #include <algorithm>
 
@@ -28,6 +31,65 @@ extern "C" {
 // Do NOT change this function.
 APICALL EXPORT std::string PLUGIN_API_VERSION() {
     return HYPRLAND_API_VERSION;
+}
+
+// bar_flat_window_top: Hyprland rounds every window surface on all four corners.
+// renderToFBInternal sets up the rounding uniforms right before a texture is drawn;
+// after it runs we grow the rounding shape upward by the bar's height, so the
+// window's top corners land under the bar and the bar carries the rounding.
+//
+// Translucent windows go through the blur path, whose inner draws don't carry the
+// surface any more, so renderTexture (the outer call, which still has it) records
+// the bar height for the draws it makes.
+static double barHeightForSurface(SP<CWLSurfaceResource> surface) {
+    const auto PSURFACE = Desktop::View::CWLSurface::fromResource(surface);
+    const auto PWINDOW  = PSURFACE ? Desktop::View::CWindow::fromView(PSURFACE->view()) : nullptr;
+    if (!PWINDOW || PWINDOW->wlSurface()->resource() != surface)
+        return 0; // only the window's main surface, not popups or subsurfaces
+
+    for (auto const& b : g_pGlobalState->bars) {
+        if (b && b->getOwner() == PWINDOW)
+            return b->visibleHeight();
+    }
+
+    return 0;
+}
+
+static double g_currentBarHeight = 0;
+
+typedef void (*origRenderTexture)(Render::GL::CHyprOpenGLImpl*, Render::CRenderContext&, SP<Render::ITexture>, const CBox&, Render::GL::CHyprOpenGLImpl::STextureRenderData);
+
+static void hkRenderTexture(Render::GL::CHyprOpenGLImpl* thisptr, Render::CRenderContext& ctx, SP<Render::ITexture> tex, const CBox& box,
+                            Render::GL::CHyprOpenGLImpl::STextureRenderData data) {
+    const double PREV = g_currentBarHeight;
+    if (data.surface)
+        g_currentBarHeight = g_pGlobalState->config.barFlatWindowTop->value() ? barHeightForSurface(data.surface) : 0;
+
+    (*(origRenderTexture)g_pRenderTextureHook->m_original)(thisptr, ctx, tex, box, data);
+
+    g_currentBarHeight = PREV;
+}
+
+typedef WP<CShader> (*origRenderToFB)(Render::GL::CHyprOpenGLImpl*, Render::CRenderContext&, SP<Render::ITexture>, const Render::GL::CHyprOpenGLImpl::STextureRenderData&,
+                                      Render::eTextureType, const CBox&);
+
+static WP<CShader> hkRenderToFBInternal(Render::GL::CHyprOpenGLImpl* thisptr, Render::CRenderContext& ctx, SP<Render::ITexture> tex,
+                                        const Render::GL::CHyprOpenGLImpl::STextureRenderData& data, Render::eTextureType texType, const CBox& newBox) {
+    auto shader = (*(origRenderToFB)g_pRenderToFBHook->m_original)(thisptr, ctx, tex, data, texType, newBox);
+
+    if (!shader || data.round <= 0 || !ctx.m_data.pMonitor || !g_pGlobalState->config.barFlatWindowTop->value())
+        return shader;
+
+    const double barHeight = data.surface ? barHeightForSurface(data.surface) : g_currentBarHeight;
+
+    if (barHeight <= 0)
+        return shader;
+
+    const double GROW = barHeight * ctx.m_data.pMonitor->m_scale * ctx.m_data.renderModif.combinedScale();
+    shader->setUniformFloat2(SHADER_TOP_LEFT, sc<float>(newBox.x), sc<float>(newBox.y - GROW));
+    shader->setUniformFloat2(SHADER_FULL_SIZE, sc<float>(newBox.width), sc<float>(newBox.height + GROW));
+
+    return shader;
 }
 
 static void onNewWindow(PHLWINDOW window) {
@@ -191,6 +253,8 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     g_pGlobalState->config.barButtonsAlignment = makeShared<Config::Values::CStringValue>("plugin:hyprbars:bar_buttons_alignment", "Alignment of the bar buttons", "right");
     g_pGlobalState->config.barPadding          = makeShared<Config::Values::CIntValue>("plugin:hyprbars:bar_padding", "Padding of the bar", 7);
     g_pGlobalState->config.barButtonPadding    = makeShared<Config::Values::CIntValue>("plugin:hyprbars:bar_button_padding", "Padding of the bar buttons", 5);
+    g_pGlobalState->config.barFlatWindowTop    = makeShared<Config::Values::CBoolValue>(
+        "plugin:hyprbars:bar_flat_window_top", "Round the bar and window as one shape: the window's top corners stay square under the bar", false);
     g_pGlobalState->config.enabled             = makeShared<Config::Values::CBoolValue>("plugin:hyprbars:enabled", "Whether bars are enabled", true);
     g_pGlobalState->config.iconOnHover         = makeShared<Config::Values::CBoolValue>("plugin:hyprbars:icon_on_hover", "Whether to use an icon on hover of the buttons", false);
     g_pGlobalState->config.buttonsOnHover      = makeShared<Config::Values::CBoolValue>(
@@ -212,7 +276,27 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     HyprlandAPI::addConfigValueV2(PHANDLE, g_pGlobalState->config.barButtonsAlignment);
     HyprlandAPI::addConfigValueV2(PHANDLE, g_pGlobalState->config.barPadding);
     HyprlandAPI::addConfigValueV2(PHANDLE, g_pGlobalState->config.barButtonPadding);
+    HyprlandAPI::addConfigValueV2(PHANDLE, g_pGlobalState->config.barFlatWindowTop);
     HyprlandAPI::addConfigValueV2(PHANDLE, g_pGlobalState->config.enabled);
+
+    for (auto& fn : HyprlandAPI::findFunctionsByName(PHANDLE, "renderToFBInternal")) {
+        if (!fn.demangled.contains("CHyprOpenGLImpl"))
+            continue;
+
+        g_pRenderToFBHook = HyprlandAPI::createFunctionHook(PHANDLE, fn.address, (void*)::hkRenderToFBInternal);
+        break;
+    }
+
+    for (auto& fn : HyprlandAPI::findFunctionsByName(PHANDLE, "renderTexture")) {
+        if (!fn.demangled.contains("CHyprOpenGLImpl::renderTexture("))
+            continue;
+
+        g_pRenderTextureHook = HyprlandAPI::createFunctionHook(PHANDLE, fn.address, (void*)::hkRenderTexture);
+        break;
+    }
+
+    if (!g_pRenderToFBHook || !g_pRenderTextureHook || !g_pRenderTextureHook->hook() || !g_pRenderToFBHook->hook())
+        HyprlandAPI::addNotification(PHANDLE, "[hyprbars] bar_flat_window_top unavailable: couldn't hook renderToFBInternal", CHyprColor{1.0, 0.2, 0.2, 1.0}, 5000);
     HyprlandAPI::addConfigValueV2(PHANDLE, g_pGlobalState->config.iconOnHover);
     HyprlandAPI::addConfigValueV2(PHANDLE, g_pGlobalState->config.buttonsOnHover);
     HyprlandAPI::addConfigValueV2(PHANDLE, g_pGlobalState->config.onDoubleClick);
