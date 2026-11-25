@@ -17,6 +17,7 @@
 #include <hyprland/src/render/OpenGL.hpp>
 #include <hyprland/src/render/Shader.hpp>
 #include <hyprland/src/desktop/view/WLSurface.hpp>
+#include <hyprland/src/protocols/core/Subcompositor.hpp>
 
 #include <algorithm>
 
@@ -42,45 +43,51 @@ APICALL EXPORT std::string PLUGIN_API_VERSION() {
 // surface any more, so renderTexture (the outer call, which still has it) records
 // the bar height for the draws it makes.
 struct SRoundTarget {
-    double       barHeight = 0;
+    double       barHeight   = 0;
     bool         mainSurface = false;
+    Vector2D     offset; // subsurface position inside the window, layout px
     PHLWINDOWREF window;
 };
 
 // Surfaces of a window with a visible bar: its main surface and its subsurfaces
-// (Firefox-based browsers draw the page in a subsurface). Popups aren't windows.
+// (Firefox-based browsers draw everything in subsurfaces, and may never draw the
+// main surface at all). Popups aren't windows.
 static SRoundTarget roundTargetFor(SP<CWLSurfaceResource> surface) {
-    const auto PSURFACE = Desktop::View::CWLSurface::fromResource(surface);
+    // a subsurface has no window of its own: find the window through its root surface
+    SP<CWLSurfaceResource> root = surface;
+    Vector2D               offset;
+    if (surface->m_role && surface->m_role->role() == SURFACE_ROLE_SUBSURFACE) {
+        const auto SUB = sc<CSubsurfaceRole*>(surface->m_role.get())->m_subsurface.lock();
+        if (!SUB)
+            return {};
+        root   = SUB->t1Parent();
+        offset = SUB->posRelativeToParent();
+        if (!root)
+            return {};
+    }
+
+    const auto PSURFACE = Desktop::View::CWLSurface::fromResource(root);
     const auto PWINDOW  = PSURFACE ? Desktop::View::CWindow::fromView(PSURFACE->view()) : nullptr;
-    if (!PWINDOW)
+    if (!PWINDOW || PWINDOW->wlSurface()->resource() != root)
         return {};
 
     for (auto const& b : g_pGlobalState->bars) {
         if (b && b->getOwner() == PWINDOW)
-            return {.barHeight = b->visibleHeight(), .mainSurface = PWINDOW->wlSurface()->resource() == surface, .window = PWINDOW};
+            return {.barHeight = b->visibleHeight(), .mainSurface = root == surface, .offset = offset, .window = PWINDOW};
     }
 
     return {};
 }
 
 static SRoundTarget g_current;
-// Box of the last drawn main surface (render coords, before renderModif).
-// Hyprland draws the main surface first, so its subsurfaces can round to it.
-static CBox         g_mainBox;
-static PHLWINDOWREF g_mainBoxWindow;
 
 typedef void (*origRenderTexture)(Render::GL::CHyprOpenGLImpl*, Render::CRenderContext&, SP<Render::ITexture>, const CBox&, Render::GL::CHyprOpenGLImpl::STextureRenderData);
 
 static void hkRenderTexture(Render::GL::CHyprOpenGLImpl* thisptr, Render::CRenderContext& ctx, SP<Render::ITexture> tex, const CBox& box,
                             Render::GL::CHyprOpenGLImpl::STextureRenderData data) {
     const auto PREV = g_current;
-    if (data.surface) {
+    if (data.surface)
         g_current = g_pGlobalState->config.barFlatWindowTop->value() ? roundTargetFor(data.surface) : SRoundTarget{};
-        if (g_current.mainSurface && g_current.barHeight > 0) {
-            g_mainBox       = box;
-            g_mainBoxWindow = g_current.window;
-        }
-    }
 
     (*(origRenderTexture)g_pRenderTextureHook->m_original)(thisptr, ctx, tex, box, data);
 
@@ -101,16 +108,19 @@ static WP<CShader> hkRenderToFBInternal(Render::GL::CHyprOpenGLImpl* thisptr, Re
     if (TARGET.barHeight <= 0)
         return shader;
 
-    // round the window's shape, not the subsurface's own box
+    const double SCALE = ctx.m_data.pMonitor->m_scale * ctx.m_data.renderModif.combinedScale();
+
+    // round the window's shape, not a subsurface's own box
     CBox shape = newBox;
     if (!TARGET.mainSurface) {
-        if (g_mainBoxWindow != TARGET.window)
+        const auto PWINDOW = TARGET.window.lock();
+        if (!PWINDOW)
             return shader;
-        shape = g_mainBox;
-        ctx.m_data.renderModif.applyToBox(shape);
+        const auto SIZE = PWINDOW->size(Desktop::View::IGeometric::GEOMETRIC_CURRENT);
+        shape           = {newBox.x - TARGET.offset.x * SCALE, newBox.y - TARGET.offset.y * SCALE, SIZE.x * SCALE, SIZE.y * SCALE};
     }
 
-    const double GROW = TARGET.barHeight * ctx.m_data.pMonitor->m_scale * ctx.m_data.renderModif.combinedScale();
+    const double GROW = TARGET.barHeight * SCALE;
     shader->setUniformFloat2(SHADER_TOP_LEFT, sc<float>(shape.x), sc<float>(shape.y - GROW));
     shader->setUniformFloat2(SHADER_FULL_SIZE, sc<float>(shape.width), sc<float>(shape.height + GROW));
 
